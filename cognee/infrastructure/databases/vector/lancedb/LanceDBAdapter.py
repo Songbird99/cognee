@@ -1,5 +1,10 @@
 import asyncio
+import os
 from os import path
+from pathlib import Path
+from urllib.parse import urlparse
+
+import boto3
 import lancedb
 from pydantic import BaseModel
 from lancedb.pydantic import LanceModel, Vector
@@ -65,7 +70,47 @@ class LanceDBAdapter(VectorDBInterface):
             - lancedb.AsyncConnection: An active connection to the LanceDB.
         """
         if self.connection is None:
-            self.connection = await lancedb.connect_async(self.url, api_key=self.api_key)
+            # Build storage_options for S3/MinIO if URL starts with s3://
+            storage_options = None
+            if self.url and self.url.startswith("s3://"):
+                storage_options = {}
+
+                # Check for AWS credentials (multiple env var names for compatibility)
+                aws_region = os.getenv("aws_region") or os.getenv("AWS_REGION")
+                aws_endpoint = os.getenv("aws_endpoint_url") or os.getenv("AWS_ENDPOINT_URL")
+                aws_access_key = os.getenv("aws_access_key_id") or os.getenv("AWS_ACCESS_KEY_ID")
+                aws_secret_key = os.getenv("aws_secret_access_key") or os.getenv("AWS_SECRET_ACCESS_KEY")
+                allow_http = os.getenv("allow_http") or os.getenv("ALLOW_HTTP")
+
+                # Also check S3_ prefixed vars for LanceDB
+                s3_region = os.getenv("S3_REGION")
+                s3_endpoint = os.getenv("S3_ENDPOINT")
+                s3_access_key = os.getenv("S3_ACCESS_KEY_ID")
+                s3_secret_key = os.getenv("S3_SECRET_ACCESS_KEY")
+                s3_allow_http = os.getenv("S3_ALLOW_HTTP")
+
+                # Prefer S3_ prefixed vars, fallback to AWS_ vars
+                if s3_region or aws_region:
+                    storage_options["region"] = s3_region or aws_region
+                if s3_endpoint or aws_endpoint:
+                    storage_options["endpoint"] = s3_endpoint or aws_endpoint
+                if s3_access_key or aws_access_key:
+                    storage_options["aws_access_key_id"] = s3_access_key or aws_access_key
+                if s3_secret_key or aws_secret_key:
+                    storage_options["aws_secret_access_key"] = s3_secret_key or aws_secret_key
+                if s3_allow_http or allow_http:
+                    # LanceDB expects string "true", not boolean
+                    storage_options["allow_http"] = "true"
+
+            # Connect with storage_options if provided
+            if storage_options:
+                self.connection = await lancedb.connect_async(
+                    self.url,
+                    api_key=self.api_key,
+                    storage_options=storage_options
+                )
+            else:
+                self.connection = await lancedb.connect_async(self.url, api_key=self.api_key)
 
         return self.connection
 
@@ -201,6 +246,8 @@ class LanceDBAdapter(VectorDBInterface):
                 .execute(lance_data_points)
             )
 
+        await self._sync_local_db_to_s3()
+
     async def retrieve(self, collection_name: str, data_point_ids: list[str]):
         collection = await self.get_collection(collection_name)
 
@@ -288,6 +335,8 @@ class LanceDBAdapter(VectorDBInterface):
         for data_point_id in data_point_ids:
             await collection.delete(f"id = '{data_point_id}'")
 
+        await self._sync_local_db_to_s3()
+
     async def create_vector_index(self, index_name: str, index_property_name: str):
         await self.create_collection(
             f"{index_name}_{index_property_name}", payload_schema=IndexSchema
@@ -306,6 +355,73 @@ class LanceDBAdapter(VectorDBInterface):
                 for data_point in data_points
             ],
         )
+
+    async def _sync_local_db_to_s3(self) -> None:
+        """Ensure LanceDB files are mirrored to S3 when running in S3 storage mode."""
+
+        if not (self.url and self.url.startswith("s3://")):
+            return
+
+        connection = await self.get_connection()
+
+        local_uri = getattr(connection, "uri", None)
+        if not local_uri:
+            return
+
+        local_dir = Path(local_uri.replace("file://", ""))
+        if not local_dir.exists():
+            return
+
+        parsed = urlparse(self.url)
+        bucket = parsed.netloc
+        prefix = parsed.path.lstrip("/")
+
+        if not bucket:
+            return
+
+        endpoint = (
+            os.getenv("AWS_ENDPOINT_URL")
+            or os.getenv("aws_endpoint_url")
+            or os.getenv("S3_ENDPOINT")
+        )
+        access_key = (
+            os.getenv("AWS_ACCESS_KEY_ID")
+            or os.getenv("aws_access_key_id")
+            or os.getenv("S3_ACCESS_KEY_ID")
+        )
+        secret_key = (
+            os.getenv("AWS_SECRET_ACCESS_KEY")
+            or os.getenv("aws_secret_access_key")
+            or os.getenv("S3_SECRET_ACCESS_KEY")
+        )
+        region = (
+            os.getenv("AWS_REGION")
+            or os.getenv("aws_region")
+            or os.getenv("S3_REGION")
+            or "us-east-1"
+        )
+
+        if not (access_key and secret_key):
+            return
+
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=region,
+        )
+
+        loop = asyncio.get_running_loop()
+
+        async def upload(path: Path) -> None:
+            key = f"{prefix}/{path.relative_to(local_dir)}"
+            await loop.run_in_executor(None, s3_client.upload_file, str(path), bucket, key)
+
+        upload_tasks = [upload(file_path) for file_path in local_dir.rglob("*") if file_path.is_file()]
+
+        if upload_tasks:
+            await asyncio.gather(*upload_tasks)
 
     async def prune(self):
         connection = await self.get_connection()
