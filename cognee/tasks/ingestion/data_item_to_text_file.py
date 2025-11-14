@@ -45,7 +45,22 @@ async def data_item_to_text_file(
             # TODO: Rework this to work with file streams and not saving data to temp storage
             # Note: proper suffix information is needed for OpenAI to handle mp3 files
             path_info = Path(parsed_url.path)
-            with tempfile.NamedTemporaryFile(mode="wb", suffix=path_info.suffix) as temp_file:
+
+            # Parse S3 path: /<project-id>/files/... → /tmp/cognee/<project-id>/
+            parts = [p for p in path_info.parts if p]
+            if len(parts) >= 2:
+                project_id = parts[0]
+                temp_dir = Path(os.environ.get("COGNEE_TEMP_DIR", "/tmp/cognee")) / project_id
+            else:
+                temp_dir = Path(os.environ.get("COGNEE_TEMP_DIR", "/tmp/cognee_tmp"))
+
+            temp_dir.mkdir(parents=True, exist_ok=True)
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=path_info.suffix,
+                dir=str(temp_dir),
+            ) as temp_file:
                 await pull_from_s3(data_item_path, temp_file)
                 temp_file.flush()  # Data needs to be saved to local storage
                 loader = get_loader_engine()

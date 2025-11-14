@@ -79,7 +79,10 @@ async def set_database_global_context_variables(dataset: Union[str, UUID], user_
     project_root = os.path.join(base_config.system_root_directory, project_segment)
     graph_root = os.path.join(project_root, "graph")
     vector_root = os.path.join(project_root, "vector")
-    files_root = os.path.join(base_config.data_root_directory, project_segment, "files")
+    processed_subdir = os.getenv("COGNEE_PROCESSED_SUBDIR", "files")
+    files_root = os.path.join(
+        base_config.data_root_directory, project_segment, processed_subdir
+    )
 
     if not graph_root.startswith("s3://"):
         os.makedirs(graph_root, exist_ok=True)

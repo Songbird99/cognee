@@ -1,4 +1,5 @@
 from typing import BinaryIO, Union, Optional
+import os
 from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
 from .classify import classify
 import hashlib
@@ -27,6 +28,13 @@ async def save_data_to_file(
             extension = file_extension.lstrip(".")
             file_name_without_ext = file_name.rsplit(".", 1)[0]
             file_name = f"{file_name_without_ext}.{extension}"
+
+        # Check if we should skip saving processed files (to avoid cluttering S3)
+        skip_save = os.getenv("COGNEE_SKIP_PROCESSED_FILE_STORAGE", "false").lower() == "true"
+
+        if skip_save and file_name.startswith("text_"):
+            # Return a virtual path without actually saving the file
+            return f"s3://{data_root_directory}/{file_name}"
 
         storage = get_file_storage(data_root_directory)
 

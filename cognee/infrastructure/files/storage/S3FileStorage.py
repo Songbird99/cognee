@@ -63,6 +63,14 @@ class S3FileStorage(Storage):
         """
         full_file_path = os.path.join(self.storage_path.replace("s3://", ""), file_path)
 
+        # Check if we should skip saving processed files (to avoid cluttering S3)
+        skip_save = os.getenv("COGNEE_SKIP_PROCESSED_FILE_STORAGE", "false").lower() == "true"
+        filename = os.path.basename(file_path)
+
+        if skip_save and (filename.startswith("text_") or (filename.startswith("tmp") and "." not in filename)):
+            # Return a virtual path without actually saving the file
+            return "s3://" + full_file_path
+
         file_dir_path = os.path.dirname(full_file_path)
 
         await self.ensure_directory_exists(file_dir_path)
